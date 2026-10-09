@@ -1,3 +1,4 @@
+#include <EEPROM.h>
 #include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -8,6 +9,8 @@
 #define DEBUG 0
 #define SCREEN 0
 #define USING_VOLUME_LIB 0
+#define USING_EEPROM 1
+#define CLEAR_EEPROM 0
 
 #if USING_VOLUME_LIB == 0
   #define DELAY(x) delay(x)
@@ -99,6 +102,17 @@
   #define NODE_SNAKE_WIDTH 6
   #define NODE_SNAKE_HEIGHT 5
 #endif
+
+//
+#define SAVE_MAGIC 0xABCD
+#define NUM_MAGIC_1_ADDR 0
+#define NUM_MAGIC_2_ADDR 2
+#define NUM_MAGIC_3_ADDR 4
+#define NUM_MAGIC_4_ADDR 6
+#define BRIGHT_LEV_ADDR 8
+#define GAME_MODE_ADDR 9
+#define SCORES_ADDR 10
+#define GAME_STATE_ADDR 298
 
 // declare game menu
 #define GAME_SNAKE_MENU 0
@@ -203,6 +217,14 @@ const uint8_t level_hide_bitmap[] PROGMEM= {
   0b10101000
 };
 
+#if SCREEN == 0
+  const uint8_t food_bitmap[] PROGMEM= {
+    0b01000000,
+    0b10100000,
+    0b01000000
+  };
+#endif
+
 const unsigned char game_start_menu_bitmap [] PROGMEM = {
 	// 'Snake - Game start menu screen', 84x48px
 	0xff, 0xf9, 0xff, 0xff, 0xff, 0xff, 0xff, 0x1f, 0xff, 0xff, 0xf0, 0xff, 0xe1, 0xff, 0xf1, 0xf3, 
@@ -293,29 +315,74 @@ uint16_t scores[3] = {0, 0, 0};
 // init pot value
 uint16_t pot_value = 0;
 
+// init button state
+uint8_t btn_state = 0;
+
 unsigned long curr_time_gameplay;
+unsigned long time_render_init_game;
+unsigned long time_init_menu;
+
+// declare address EPPROM
+// store: scores, is_game_init, is_food_eaten, is_game_over, game_mode_flag, brightness_level and game state
+// addr 0 (2 bytes): number magic 1 = 0xABCD (check brightness_level is saved)
+// addr 2 (2 bytes): number magic 2 = 0xABCD (check game_mode_flag is saved)
+// addr 4 (2 bytes): number magic 3 = 0xABCD (check scores is saved)
+// addr 6 (2 bytes): number magic 4 = 0xABCD (check game state is saved)
+// addr 8 (1 byte): brightness_level
+// addr 9 (1 byte): game_mode_flag
+// addr 10 (288 bytes) : scores
+// addr 298: game_state
+struct GameState{
+  int8_t game_flag; //is_game_init; bit 0, is_food_eaten: bit 1, is_game_over: bit 2
+  int16_t curr_score;
+  int8_t head_snake_row_x;
+  int8_t head_snake_colm_y;
+  int8_t prev_head_snake_row_x;
+  int8_t prev_head_snake_colm_y;
+  int8_t tail_snake_row_x;
+  int8_t tail_snake_colm_y;
+  int8_t prev_tail_snake_row_x;
+  int8_t prev_tail_snake_colm_y;
+  int8_t prev_tail_snake_direct;
+  int8_t food_row_x;
+  int8_t food_colm_y;
+  int8_t prev_food_row_x;
+  int8_t prev_food_colm_y;
+  int8_t game_map[ROWS][COLMS];
+};
 
 // get (x, y) in screen from (x, y) in game map matrix
 uint16_t getXPosScreen(uint8_t row_x, uint8_t colm_y);
 uint16_t getYPosScreen(uint8_t row_x, uint8_t colm_y);
 // handle buttons
 uint8_t handleButtons(void);
+// eeprom
+void writeSaveGame(void);
+void loadSaveGame(void);
+void loadScores(void);
+void writeScores(void);
+void writeGameModeFlag(void);
+void writeBrightnessLevel(void);
+// init
 void initMenu(void);
+void initGame(void);
 void initWall(void);
 void initSnake(void);
 void initFood(void);
+// handle
 void gamePlay(uint8_t button_value);
+uint8_t checkFutureSnake(uint8_t row_x, uint8_t colm_y, uint8_t direct);
 void controlMenu(uint8_t button_value);
 void controlGameStartMenu(uint8_t button_value);
+void gameOver(void);
+// render
 void renderGameplay(void);
 void renderMenuInit(void);
 void renderMenu(void);
 void renderGameStartMenu(void);
+// sound
 void createFoodEatenSound(void);
 void createGameOverSound(void);
-uint8_t checkFutureSnake(uint8_t row_x, uint8_t colm_y, uint8_t direct);
-void gameOver(void);
-void initGame(void);
 
 void setup() {
   Serial.begin(9600);
@@ -326,7 +393,19 @@ void setup() {
   pinMode(CE_PIN, OUTPUT);
   pinMode(CP_PIN, OUTPUT);
   pinMode(QH_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  analogWrite(LED_PIN, map(brightness_level, 0, 8, 255, 0));
 
+  #if CLEAR_EEPROM == 1
+    for (int i = 0; i < EEPROM.length(); i++) {
+      EEPROM.write(i, 0); // Đặt lại từng ô nhớ về 0
+    }
+  #else
+    // load game state from EPPROM to SRAM
+    loadSaveGame();
+    loadScores();
+  #endif
   // init done
   #if SCREEN == 0
     display.begin();
@@ -339,25 +418,26 @@ void setup() {
     display.begin();
   #endif
 
-  // you can change the contrast around to adapt the display
-  // for the best viewing!
-  
-  // for lcd nokia 5110, oled 1106
-  // display.setContrast(75);
+  // #if USING_EEPROM == 1
+  //   uint16_t num_magic_4 = 0;
+  //   EEPROM.put(NUM_MAGIC_4_ADDR, num_magic_4);
+  // #endif
 
-  display.display();
-  // DELAY(2000);
   display.clearDisplay();
   // initGame();
   // initMenu();
 }
 
 void loop() {
+  analogWrite(LED_PIN, map(brightness_level, 0, 8, 255, 0));
   uint8_t val = handleButtons();
-  pot_value = analogRead(POT);
+  // debugln(val);
+  // pot_value = analogRead(POT);
+  // debugln(brightness_level);
   switch(game_flag & 0b00000011){
     case 0:
       controlGameStartMenu(val);
+      DELAY(300);
       break;
     case 1:
       display.invertDisplay(false);
@@ -365,6 +445,7 @@ void loop() {
         initMenu();
       }
       controlMenu(val);
+      DELAY(300);
       break;
     case 2:
       display.invertDisplay(false);
@@ -378,7 +459,7 @@ void loop() {
         // debugln(F("Truoc thuc hien ham gamePlay"));
         gamePlay(val);
         // debugln(F("Da thuc hien ham gamePlay"));
-        printMatrix();
+        // printMatrix();
       }
       else{
         gameOver();
@@ -388,20 +469,137 @@ void loop() {
       }
       break;
   }
-
-  // controlMenu(val);
-  // debug("Index of Row selected: ");
-  // debugln(menu_indexes[0] & 0b00001111);
-  // debug("Title");
-  // debugln(menu[menu_indexes[1] & 0b00001111]);
-  // debug("First row: ");
-  // debugln(menu[menu_indexes[2] & 0b00001111]);
-  // debug("Second row: ");
-  // debugln(menu[menu_indexes[3] & 0b00001111]);
-  // debug("Third row: ");
-  // debugln(menu[menu_indexes[4] & 0b00001111]);
-  DELAY(1000);
 }
+
+#if USING_EEPROM == 1
+  void writeSaveGame(void){
+    uint16_t num_magic_4 = 0xABCD;
+    EEPROM.put(NUM_MAGIC_4_ADDR, num_magic_4);
+    GameState game_state;
+    game_state.game_flag = ((game_flag >> 3) & 0b00000001) | (((game_mode_flag >> 6) & 0b00000011) << 1);
+    game_state.curr_score = curr_score;
+    game_state.head_snake_row_x = head_snake_row_x;
+    game_state.head_snake_colm_y = head_snake_colm_y;
+    game_state.prev_head_snake_row_x = prev_head_snake_row_x;
+    game_state.prev_head_snake_colm_y = prev_head_snake_colm_y;
+    game_state.tail_snake_row_x = tail_snake_row_x;
+    game_state.tail_snake_colm_y = tail_snake_colm_y;
+    game_state.prev_tail_snake_row_x = prev_tail_snake_row_x;
+    game_state.prev_tail_snake_colm_y = prev_tail_snake_colm_y;
+    game_state.prev_tail_snake_direct = prev_tail_snake_direct;
+    game_state.food_row_x = food_row_x;
+    game_state.food_colm_y = food_colm_y;
+    game_state.prev_food_row_x = prev_food_row_x;
+    game_state.prev_food_colm_y = prev_food_colm_y;
+    for(int8_t i = 0; i < ROWS; i++){
+      for(int8_t j = 0; j < COLMS; j++){
+        game_state.game_map[i][j] = game_map[i][j];
+      }
+    }
+    EEPROM.put(GAME_STATE_ADDR, game_state);
+  }
+  void loadSaveGame(void){
+    uint16_t num_magics[4];
+    EEPROM.get(NUM_MAGIC_1_ADDR, num_magics);
+    if(num_magics[0] == SAVE_MAGIC){
+      EEPROM.get(BRIGHT_LEV_ADDR, brightness_level);
+    }
+    if(num_magics[1] == SAVE_MAGIC){
+      uint8_t load_game_mode_flag = 0b00000100;
+      EEPROM.get(GAME_MODE_ADDR, load_game_mode_flag);
+      game_mode_flag = (game_mode_flag & 0b11000000) | (load_game_mode_flag & 0b00111111); 
+    }
+    if(num_magics[3] == SAVE_MAGIC){
+      GameState load_game_state;
+      EEPROM.get(GAME_STATE_ADDR, load_game_state);
+      game_flag = (game_flag & 0b11110111) | ((load_game_state.game_flag & 0b00000001) << 3); //load is_game_init_value
+      if(((game_flag >> 3) & 0b00000001) == 1){ // is_game_init == 1
+        game_flag |= 0b10000000; // is_first_game_init = 1
+      }
+      game_mode_flag = (game_mode_flag & 0b00111111) | (((load_game_state.game_flag >> 1) & 0b00000011) << 6); //load is_game_over and is_food_eaten
+      curr_score = load_game_state.curr_score;
+      head_snake_row_x = load_game_state.head_snake_row_x;
+      head_snake_colm_y = load_game_state.head_snake_colm_y;
+      prev_head_snake_row_x = load_game_state.prev_head_snake_row_x;
+      prev_head_snake_colm_y = load_game_state.prev_head_snake_colm_y;
+      tail_snake_row_x = load_game_state.tail_snake_row_x;
+      tail_snake_colm_y = load_game_state.tail_snake_colm_y;
+      prev_tail_snake_row_x = load_game_state.prev_tail_snake_row_x;
+      prev_tail_snake_colm_y = load_game_state.prev_tail_snake_colm_y;
+      prev_tail_snake_direct = load_game_state.prev_tail_snake_direct;
+      food_row_x = load_game_state.food_row_x;
+      food_colm_y = load_game_state.food_colm_y;
+      prev_food_row_x = load_game_state.prev_food_row_x;
+      prev_food_colm_y = load_game_state.prev_food_colm_y;
+      for(int8_t i = 0; i < ROWS; i++){
+        for(int8_t j = 0; j < COLMS; j++){
+          game_map[i][j] = load_game_state.game_map[i][j];
+        }
+      }
+    }
+  }
+  void loadScores(void){
+    uint16_t num_magic_3;
+    EEPROM.get(NUM_MAGIC_3_ADDR, num_magic_3);
+    if(num_magic_3 != SAVE_MAGIC)
+      return;
+    int addr = SCORES_ADDR;
+    int level = (game_mode_flag) & 0b00000111;
+    int game_type = (game_mode_flag >> 3) & 0b00000111;
+    uint16_t load_scores[3];
+    addr += ((game_type * 8 + level) * 6);
+    EEPROM.get(addr, load_scores);
+    for(int i = 0; i < 3; i++){
+      scores[i] = load_scores[i];
+    }
+  }
+  void writeScores(void){
+    uint16_t num_magic_3;
+    EEPROM.get(NUM_MAGIC_3_ADDR, num_magic_3);
+    if(num_magic_3 != SAVE_MAGIC){
+      num_magic_3 = 0xABCD;
+      uint16_t full_scores[144] = {0};
+      EEPROM.put(NUM_MAGIC_3_ADDR, num_magic_3);
+      EEPROM.put(SCORES_ADDR, full_scores);
+    }
+    else{
+      int addr = SCORES_ADDR;
+      int level = (game_mode_flag) & 0b00000111;
+      int game_type = (game_mode_flag >> 3) & 0b00000111;
+      addr += ((game_type * 8 + level) * 6);
+      EEPROM.put(addr, scores);
+    }
+  }
+  void writeGameModeFlag(void){
+    uint16_t num_magic_2 = 0xABCD;
+    EEPROM.put(NUM_MAGIC_2_ADDR, num_magic_2);
+    EEPROM.put(GAME_MODE_ADDR, (game_mode_flag & 0b00111111));
+  }
+  void writeBrightnessLevel(void){
+    uint16_t num_magic_1 = 0xABCD;
+    EEPROM.put(NUM_MAGIC_1_ADDR, num_magic_1);
+    EEPROM.put(BRIGHT_LEV_ADDR, brightness_level);
+  }
+#else
+  void writeSaveGame(void){
+    return;
+  }
+  void loadSaveGame(void){
+    return;
+  }
+  void loadScores(void){
+    return;
+  }
+  void writeScores(void){
+    return;
+  }
+  void writeGameModeFlag(void){
+    return;
+  }
+  void writeBrightnessLevel(void){
+    return;
+  }
+#endif
 
 void printPos(char message[], int x, int y) {
   debug(message);
@@ -611,10 +809,9 @@ void renderGameInit(void){
         } else {
         if (game_map[i][j] == FOOD) {
           #if SCREEN == 0
-            display.drawPixel(pos_x, pos_y - 1, SHOW);
-            display.drawPixel(pos_x - 1, pos_y, SHOW);
-            display.drawPixel(pos_x, pos_y + 1, SHOW);
-            display.drawPixel(pos_x + 1, pos_y, SHOW);
+            pos_x -= 1;
+            pos_y -= 1;
+            display.drawBitmap(pos_x, pos_y, food_bitmap, 3, 3, SHOW);
           #else
             display.drawPixel(pos_x, pos_y, SHOW);
             display.drawPixel(pos_x, pos_y - 2, SHOW);
@@ -712,6 +909,7 @@ void renderGameInit(void){
       } 
   }
   display.display();
+  time_render_init_game = MILLIS();
 }
 void renderGameplay(void) {
   if(((game_flag >> 3) & 1) == 1){ // is_game_init == 1
@@ -763,16 +961,14 @@ void renderGameplay(void) {
             break;
         }
     }
-    // Draw new food
     pos_x = getXPosScreen(prev_food_row_x, prev_food_colm_y);
     pos_y = getYPosScreen(prev_food_row_x, prev_food_colm_y);
     if (prev_food_row_x != 0 && prev_food_colm_y != 0) {
       // Remove old food
       #if SCREEN == 0
-        display.drawPixel(pos_x, pos_y - 1, HIDE);
-        display.drawPixel(pos_x - 1, pos_y, HIDE);
-        display.drawPixel(pos_x, pos_y + 1, HIDE);
-        display.drawPixel(pos_x + 1, pos_y, HIDE);
+        pos_x -= 1;
+        pos_y -= 1;
+        display.drawBitmap(pos_x, pos_y, food_bitmap, 3, 3, HIDE);
       #else
         display.drawPixel(pos_x, pos_y, HIDE);
         display.drawPixel(pos_x, pos_y - 2, HIDE);
@@ -790,10 +986,13 @@ void renderGameplay(void) {
       pos_x = getXPosScreen(food_row_x, food_colm_y);
       pos_y = getYPosScreen(food_row_x, food_colm_y);
       #if SCREEN == 0
-        display.drawPixel(pos_x, pos_y - 1, SHOW);
-        display.drawPixel(pos_x - 1, pos_y, SHOW);
-        display.drawPixel(pos_x, pos_y + 1, SHOW);
-        display.drawPixel(pos_x + 1, pos_y, SHOW);
+        pos_x -= 1;
+        pos_y -= 1;
+        display.drawBitmap(pos_x, pos_y, food_bitmap, 3, 3, SHOW);
+        // display.drawPixel(pos_x, pos_y - 1, SHOW);
+        // display.drawPixel(pos_x - 1, pos_y, SHOW);
+        // display.drawPixel(pos_x, pos_y + 1, SHOW);
+        // display.drawPixel(pos_x + 1, pos_y, SHOW);
       #else
         display.drawPixel(pos_x, pos_y, SHOW);
         display.drawPixel(pos_x, pos_y - 2, SHOW);
@@ -944,6 +1143,7 @@ void renderMenuInit(void) {
       }
     }
   display.display();
+  time_init_menu = MILLIS();
 }
 void renderMenu(void) {
   char buffer[15];
@@ -1051,7 +1251,7 @@ void renderMenu(void) {
           cursor_pos_y = 37;
         }
         display.setCursor(6, cursor_pos_y + 2);
-        if (prev_index != curr_index) {
+        if (prev_index != curr_index || (title_idx != prev_title_idx && prev_title_idx == 4)) {
           if (selected_index == i) {
             display.fillRect(0, cursor_pos_y, 84, 11, SHOW);
             display.setTextColor(HIDE);
@@ -1101,8 +1301,8 @@ void renderMenu(void) {
         pos_x += ((i - 1) * 5);
         display.drawBitmap(pos_x, pos_y, level_hide_bitmap, 5, 5, SHOW);
       }
-      Serial.print(F("selected_index: "));
-      Serial.println(selected_index);
+      // Serial.print(F("selected_index: "));
+      // Serial.println(selected_index);
     }
   }
   display.display();
@@ -1154,14 +1354,13 @@ uint8_t handleButtons(void) {
 
   uint8_t cnt = 0;
   uint8_t res = 0;
+  if(incoming == 0b11111111) return 0;
   for(uint8_t i = 0; i < 6; i++){
     if(((incoming >> i) & 1) == 0){
       res = i + 1;
       cnt++;
+      if(cnt > 1) return 0;
     }
-  }
-  if(cnt > 1 || cnt == 0){
-    return 0;
   }
   return res;
 }
@@ -1172,33 +1371,37 @@ uint8_t handleButtons(void) {
 //      Else game paused
 // Else snake move straight
 void gamePlay(uint8_t button_value) {
-  // bit 0 - bit 1: start game menu - game menu - gameplay
-  //  00: start game menu
-  //  01: game menu
-  //  10: gameplay
-  // bit 2: is_menu_init = 0;
-  // bit 3: is_game_init = 0;
-  // bit 6: is_gameplay_rendered = 0
-  
   //gameplay
   game_flag = (game_flag & 0b11111100)  | 0b00000010;
   game_flag &= 0b11111011; // is_menu_init = 0
   // check if button is OK or BACK, return no value in function and change gameflag value to game menu or game start menu
-  switch (button_value) {
-    case OK:
-      //return to menu
-      game_flag = (game_flag & 0b11111100) | 0b00000001;
-      game_flag = game_flag & 0b11111011; //is_menu_init = 0
-      display.clearDisplay();
-      return;
-      break;
-    case BACK:
-      //return to game start menu
-      game_flag &= 0b11111100;
-      display.clearDisplay();
-      return;
-      break;
-  }
+    switch (button_value) {
+      case OK:
+        if(MILLIS() - time_render_init_game >= 600){
+          //return to menu
+          game_flag = (game_flag & 0b11111100) | 0b00000001;
+          game_flag = game_flag & 0b11111011; //is_menu_init = 0
+          display.clearDisplay();
+          // save state game to EPPROM
+          writeSaveGame();
+          return;
+        }
+        else
+          button_value = 0;
+        break;
+      case BACK:
+        if(MILLIS() - time_render_init_game >= 600){
+          //return to game start menu
+          game_flag &= 0b11111100;
+          display.clearDisplay();
+          // save state game to EPPROM
+          writeSaveGame();
+          return;
+        }
+        else
+          button_value = 0;
+        break;
+    }
   uint8_t level = (game_mode_flag & 0b00000111);
   uint8_t game_type = (game_mode_flag >> 3) & 0b00000111;
   unsigned long time_delay = (unsigned long)timeDelay(level);
@@ -1207,31 +1410,36 @@ void gamePlay(uint8_t button_value) {
     uint8_t head_direct = (game_map[head_snake_row_x][head_snake_colm_y] >> 3) & 0b00000111;
     uint8_t head_direct_future = 0;
 
-    if (button_value == 0) {
+    btn_state = button_value;
+    debugln(btn_state);
+    if (btn_state == 0) {
       head_direct_future = head_direct;
     } else {
-      switch (button_value) {
+      switch (btn_state) {
         case TOP:
           if (head_direct == DOWN) head_direct_future = head_direct;
+          else head_direct_future = btn_state;
           break;
         case DOWN:
           if (head_direct == TOP) head_direct_future = head_direct;
+          else head_direct_future = btn_state;
           break;
         case LEFT:
           if (head_direct == RIGHT) head_direct_future = head_direct;
+          else head_direct_future = btn_state;
           break;
         case RIGHT:
           if (head_direct == LEFT) head_direct_future = head_direct;
+          else head_direct_future = btn_state;
           break;
       }
-      head_direct_future = button_value;
     }
     // debugln(head_direct_future);
     uint8_t snake_future = checkFutureSnake(head_snake_row_x, head_snake_colm_y, head_direct_future);
 
     if (snake_future == WILL_BE_GAMEOVER) {
       game_mode_flag |= 0b01000000;  // is_game_over = 1
-
+      btn_state = 0;
       return;
     } else {
       // head snake move in matrix
@@ -1369,7 +1577,6 @@ void gamePlay(uint8_t button_value) {
     if(((game_mode_flag >> 7) & 1) == 1){  //is_food_eaten == 1
       createFoodEatenSound();
     }
-    createFoodEatenSound();
     curr_time_gameplay = MILLIS();
     game_flag |= 0b01000000;  //is_gameplay_rendered = 1
     return;
@@ -1487,7 +1694,9 @@ uint8_t checkFutureSnake(uint8_t row_x, uint8_t colm_y, uint8_t direct) {
       new_row_x = row_x;
       break;
   }
-  if ((game_map[new_row_x][new_colm_y] > 0 && game_map[new_row_x][new_colm_y] <= 36) || game_map[new_row_x][new_colm_y] == WALL) {
+  if(((game_map[new_row_x][new_colm_y] & 0b00000111) >= 0 && (game_map[new_row_x][new_colm_y] & 0b00000111) <= RIGHT &&
+          ((game_map[new_row_x][new_colm_y] >> 3) & 0b00000111) >= TOP && ((game_map[new_row_x][new_colm_y] >> 3) & 0b00000111) <= RIGHT &&
+          (((game_map[new_row_x][new_colm_y] >> 6) & 0b00000011) == 0 || ((game_map[new_row_x][new_colm_y] >> 6) & 0b00000011) == 1)) || game_map[new_row_x][new_colm_y] == WALL) {
       // debugln("----GAME OVER");
       return WILL_BE_GAMEOVER;
     } else if (game_map[new_row_x][new_colm_y] == FOOD) {
@@ -1692,16 +1901,36 @@ void controlMenu(uint8_t button_value) {
         if(menu_type == BRIGHTNESS_MENU){
           brightness_level = menu_indexes[0] & 0b00001111;
           #if SCREEN == 0
-            analogWrite(LED_PIN, map(brightness_level, 0, 8, 0, 255));
+            analogWrite(LED_PIN, map(brightness_level, 0, 8, 255, 0));
           #endif
+          if(((game_flag >> 3) & 1) == 1){
+            menu_idx = 0;
+            menu_indexes[1] = (menu_indexes[1] & 0b11110000) | 0b00001000;
+          }
+          else{
+            menu_idx = 1;
+            menu_indexes[1] = (menu_indexes[1] & 0b11110000) | 0b00000111;
+          }
+          // save brightness level to eeprom
+          writeBrightnessLevel();
         }
         else{
           game_mode_flag = (game_mode_flag & 0b11111000) | ((menu_indexes[0] & 0b00001111) - 1);
           resetGameSpecifications();
+          menu_idx = 1;
+          menu_indexes[1] = (menu_indexes[1] & 0b11110000) | 0b00000111;
+          // load scores from eeprom
+          loadScores();
+          // save game level to eeprom
+          writeGameModeFlag();
+          // prevent load game state from eeprom when restart
+          #if USING_EEPROM == 1
+            uint16_t num_magic_4 = 0;
+            EEPROM.put(NUM_MAGIC_4_ADDR, num_magic_4);
+          #endif
         }
-        menu_idx = 1;
+        game_flag |= 0b00000100; // is_menu_init = 1
         menu_indexes[0] &= 0b11110000;
-        menu_indexes[1] = (menu_indexes[1] & 0b11110000) | 0b00000111;
         menu_indexes[2] = (menu_indexes[2] & 0b11110000) | (menu_idx & 0b00001111);
         menu_indexes[3] = (menu_indexes[3] & 0b11110000) | ((menu_idx + 1) & 0b00001111);
         menu_indexes[4] = (menu_indexes[4] & 0b11110000) | ((menu_idx + 2) & 0b00001111);
@@ -1709,13 +1938,16 @@ void controlMenu(uint8_t button_value) {
       else{
         strcpy_P(buffer, (char *)pgm_read_ptr(&(menu_table[menu_idx])));
         if (strcmp(buffer, "CONTINUE") == 0) {
-          // continue game
-          game_flag = (game_flag & 0b11111100) | 0b00000010;
-          display.clearDisplay();
-          renderGameInit();
-          return;
+            if(MILLIS() - time_init_menu >= 600){
+              // continue game
+              game_flag = (game_flag & 0b11111100) | 0b00000010;
+              display.clearDisplay();
+              renderGameInit();
+              return;
+            }
         } else if (strcmp(buffer, "NEW GAME") == 0) {
           // create new game
+          resetGameSpecifications();
           menu_idx = 0;
           menu_indexes[0] &= 0b11110000;
           menu_indexes[1] = (menu_indexes[1] & 0b11110000) | 0b00001000;
@@ -1724,6 +1956,10 @@ void controlMenu(uint8_t button_value) {
           menu_indexes[4] = (menu_indexes[4] & 0b11110000) | ((menu_idx + 2) & 0b00001111);
           game_flag = (game_flag & 0b11111100) | 0b00000010;
           game_flag &= 0b01111111;  // is_first_game_init = 0;
+          #if USING_EEPROM == 1
+            uint16_t num_magic_4 = 0;
+            EEPROM.put(NUM_MAGIC_4_ADDR, num_magic_4);
+          #endif
           display.clearDisplay();
           return;
         } else if (strcmp(buffer, "1. CLASSIC") == 0 || strcmp(buffer, "2. INFINITY") == 0 || strcmp(buffer, "3. TUNNEL") == 0 || strcmp(buffer, "4. MILL") == 0 || strcmp(buffer, "5. RAILS") == 0 || strcmp(buffer, "6. APARTMENT") == 0) {
@@ -1741,6 +1977,15 @@ void controlMenu(uint8_t button_value) {
             game_mode_flag = (game_mode_flag & 0b11000111) | 0b00101000;
           }
           resetGameSpecifications();
+          // load scores from eeprom
+          loadScores();
+          // save game level to eeprom
+          writeGameModeFlag();
+          // prevent load game state from eeprom when restart
+          #if USING_EEPROM == 1
+            uint16_t num_magic_4 = 0;
+            EEPROM.put(NUM_MAGIC_4_ADDR, num_magic_4);
+          #endif
           menu_idx = 1;
           menu_indexes[0] &= 0b11110000;
           menu_indexes[1] = (menu_indexes[1] & 0b11110000) | 0b00000111;
@@ -1753,6 +1998,11 @@ void controlMenu(uint8_t button_value) {
           menu_indexes[2] = (menu_indexes[2] & 0b11110000) | 0b00001111;  // = -1
           menu_indexes[3] = (menu_indexes[3] & 0b11110000) | 0b00001111;  // = -1
           menu_indexes[4] = (menu_indexes[4] & 0b11110000) | 0b00001111;  // = -1
+          writeGameModeFlag();
+          #if USING_EEPROM == 1
+            uint16_t num_magic_4 = 0;
+            EEPROM.put(NUM_MAGIC_4_ADDR, num_magic_4);
+          #endif
         } else if (strcmp(buffer, "BRIGHTNESS") == 0) {
           menu_indexes[0] = (menu_indexes[0] & 0b11110000) | (brightness_level & 0b00001111);
           menu_indexes[1] = (menu_indexes[1] & 0b11110000) | 0b00000101;
@@ -1774,7 +2024,7 @@ void controlMenu(uint8_t button_value) {
           menu_indexes[3] = (menu_indexes[3] & 0b11110000) | ((menu_idx + 1) & 0b00001111);
           menu_indexes[4] = (menu_indexes[4] & 0b11110000) | ((menu_idx + 2) & 0b00001111);
         } else if (strcmp(buffer, "EXIT GAME") == 0) {
-          game_flag &= 0b01111111;  // is_first_game_init = 0;
+          game_flag &= 0b01111011;  // is_first_game_init = 0 & is_menu_init = 0;
           menu_idx = 1;
           menu_indexes[0] &= 0b11110000;
           menu_indexes[1] = (menu_indexes[1] & 0b11110000) | 0b00000111;
@@ -1785,20 +2035,20 @@ void controlMenu(uint8_t button_value) {
           gameOver();
           DELAY(1000);
           display.clearDisplay();
+          // prevent load game state from eeprom when restart
+          #if USING_EEPROM == 1
+            uint16_t num_magic_4 = 0;
+            EEPROM.put(NUM_MAGIC_4_ADDR, num_magic_4);
+          #endif
+          return;
         }
       }
       break;
     case BACK:
-      if (menu_type == GAME_SNAKE_MENU) {
+      if (menu_type == GAME_SNAKE_MENU || menu_type == IN_GAME_MENU) {
         // back to game start menu
         game_flag &= 0b11111100;
         display.clearDisplay();
-        return;
-      } else if (menu_type == IN_GAME_MENU) {
-        // back to gameplay
-        game_flag = (game_flag & 0b11111100) | 0b00000010;
-        display.clearDisplay();
-        renderGameInit();
         return;
       } else if (menu_type == HIGH_SCORES_MENU || menu_type == LEVEL_MENU || menu_type == BRIGHTNESS_MENU) {
         if (((game_flag >> 3) & 1) == 1) {  // is_game_init == 1
@@ -1820,7 +2070,7 @@ void controlMenu(uint8_t button_value) {
 
 void controlGameStartMenu(uint8_t button_value) {
   if(button_value == OK){
-    game_flag = (game_flag & 0b11111100) | 0b00000001;
+    game_flag = (game_flag & 0b11111000) | 0b00000001;
     display.clearDisplay();
     return; 
   }
@@ -1828,31 +2078,31 @@ void controlGameStartMenu(uint8_t button_value) {
 }
 
 void createFoodEatenSound(void){
-  #if USING_VOLUME_LIB == 0
-    tone(BUZZER_PIN, 2640, 9);
-    noTone(BUZZER_PIN);
-  #else
-    vol.tone(2640, map(pot_value, 0, 1023, 0, 255));
-    DELAY(9);
-    vol.noTone();
-  #endif
+  // #if USING_VOLUME_LIB == 0
+  //   tone(BUZZER_PIN, 882, 25);
+  //   noTone(BUZZER_PIN);
+  // #else
+  //   vol.tone(882, map(pot_value, 0, 1023, 0, 255));
+  //   DELAY(25);
+  //   vol.noTone();
+  // #endif
+  digitalWrite(BUZZER_PIN, HIGH);
+  DELAY(25);
+  digitalWrite(BUZZER_PIN, LOW);
 }
 void createGameOverSound(void){
-  #if USING_VOLUME_LIB == 0
-    tone(BUZZER_PIN, 441, 16);
-    tone(BUZZER_PIN, 441, 20);
-    tone(BUZZER_PIN, 441, 20);
-    noTone(BUZZER_PIN);
-  #else
-    uint8_t volume = map(pot_value, 0, 1023, 0, 255);
-    vol.tone(441, volume);
-    DELAY(16);
-    vol.tone(441, volume);
-    DELAY(20);
-    vol.tone(441, volume);
-    DELAY(20);
-    vol.noTone();
-  #endif
+  // #if USING_VOLUME_LIB == 0
+  //   tone(BUZZER_PIN, 441, 120);
+  //   noTone(BUZZER_PIN);
+  // #else
+  //   uint8_t volume = map(pot_value, 0, 1023, 0, 255);
+  //   vol.tone(441, volume);
+  //   DELAY(120);
+  //   vol.noTone();
+  // #endif
+  digitalWrite(BUZZER_PIN, HIGH);
+  DELAY(120);
+  digitalWrite(BUZZER_PIN, LOW);
 }
 
 void resetGameSpecifications(void){
@@ -1880,6 +2130,26 @@ void resetGameSpecifications(void){
   game_flag &= 0b11110111; // is_game_init = 0
   curr_score = 0;
 }
+void addCurrScoreToScoresArray(void){
+  uint16_t sorted_scores[4];
+  for(int i = 0; i < 3; i++){
+    sorted_scores[i] = scores[i];
+  }
+  sorted_scores[3] = curr_score;
+  // insertion sort
+  for(int i = 1; i < 4; i++){
+    uint16_t key = sorted_scores[i];
+    int j = i - 1;
+    while(j >= 0 && key > sorted_scores[j]){
+      sorted_scores[j + 1] = sorted_scores[j];
+      j-=1;
+    }
+    sorted_scores[j + 1] = key;
+  }
+  for(int i = 0; i < 3; i++){
+    scores[i] = sorted_scores[i];
+  }
+}
 void gameOver(void) {
   createGameOverSound();
   display.clearDisplay();
@@ -1890,5 +2160,12 @@ void gameOver(void) {
   display.print("SCORE: ");
   display.print(curr_score);
   display.display();
+  addCurrScoreToScoresArray();
   resetGameSpecifications();
+  // prevent load game state from eeprom when restart
+  #if USING_EEPROM == 1
+    uint16_t num_magic_4 = 0;
+    EEPROM.put(NUM_MAGIC_4_ADDR, num_magic_4);
+  #endif
+  writeScores();
 }
